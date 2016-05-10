@@ -17,6 +17,10 @@ from models import ConferenceForm
 from models import ConferenceForms
 from models import ConferenceQueryForm
 from models import ConferenceQueryForms
+from models import BooleanMessage
+from models import ConflictException
+from google.appengine.api import memcache
+from models import StringMessage
 
 """
 conference.py -- Udacity conference server-side Python App Engine API;
@@ -60,6 +64,11 @@ CONF_GET_REQUEST = endpoints.ResourceContainer(
 
 CONF_POST_REQUEST = endpoints.ResourceContainer(
     ConferenceForm,
+    websafeConferenceKey=messages.StringField(1),
+)
+
+CONF_GET_REQUEST = endpoints.ResourceContainer(
+    message_types.VoidMessage,
     websafeConferenceKey=messages.StringField(1),
 )
 
@@ -343,6 +352,129 @@ class ConferenceApi(remote.Service):
 
             formatted_filters.append(filtr)
         return (inequality_field, formatted_filters)
+
+# - - - Registration - - - - - - - - - - - - - - - - - - - -
+
+    @ndb.transactional()
+    def _conferenceRegistration(self, request, reg=True):
+        """Register or unregister user for selected conference."""
+        retval = None
+        prof = self._getProfileFromUser()  # get user Profile
+
+        # check if conf exists given websafeConfKey
+        # get conference; check that it exists
+        wsck = request.websafeConferenceKey
+        conf = ndb.Key(urlsafe=wsck).get()
+        if not conf:
+            raise endpoints.NotFoundException(
+                'No conference found with key: %s' % wsck)
+
+        # register
+        if reg:
+            # check if user already registered otherwise add
+            if wsck in prof.conferenceKeysToAttend:
+                raise ConflictException(
+                    "You have already registered for this conference")
+
+            # check if seats avail
+            if conf.seatsAvailable <= 0:
+                raise ConflictException(
+                    "There are no seats available.")
+
+            # register user, take away one seat
+            prof.conferenceKeysToAttend.append(wsck)
+            conf.seatsAvailable -= 1
+            retval = True
+
+        # unregister
+        else:
+            # check if user already registered
+            if wsck in prof.conferenceKeysToAttend:
+
+                # unregister user, add back one seat
+                prof.conferenceKeysToAttend.remove(wsck)
+                conf.seatsAvailable += 1
+                retval = True
+            else:
+                retval = False
+
+        # write things back to the datastore & return
+        prof.put()
+        conf.put()
+        return BooleanMessage(data=retval)
+
+    @endpoints.method(CONF_GET_REQUEST, BooleanMessage,
+                      path='conference/{websafeConferenceKey}',
+                      http_method='POST', name='registerForConference')
+    def registerForConference(self, request):
+        """Register user for selected conference."""
+        return self._conferenceRegistration(request)
+
+    @endpoints.method(message_types.VoidMessage, ConferenceForms,
+                      path='conferences/attending',
+                      http_method='GET', name='getConferencesToAttend')
+    def getConferencesToAttend(self, request):
+        """Get list of conferences that user has registered for."""
+        # TODO:
+        # step 1: get user profile
+        prof = self._getProfileFromUser()
+
+        # step 2: get conferenceKeysToAttend from profile.
+        # to make a ndb key from websafe key you can use:
+        # ndb.Key(urlsafe=my_websafe_key_string)
+        keys = prof.conferenceKeysToAttend
+        wsck = request.websafeConferenceKey
+        conf = ndb.Key(urlsafe=wsck).get()
+        if not conf:
+            raise endpoints.NotFoundException(
+                'No conference found with key: %s' % wsck)
+
+        # step 3: fetch conferences from datastore.
+        # Use get_multi(array_of_keys) to fetch all keys at once.
+        # Do not fetch them one by one!
+        conferences = ndb.get_multi(keys)
+
+        # return set of ConferenceForm objects per Conference
+        return ConferenceForms(items=[self._copyConferenceToForm(conf, "")
+                                      for conf in conferences]
+                               )
+
+# - - - Announcements - - - - - - - - - - - - - - - - - - - -
+    @staticmethod
+    def _cacheAnnouncement():
+        """Create Announcement & assign to memcache; used by
+        memcache cron job & putAnnouncement().
+        """
+        confs = Conference.query(ndb.AND(
+            Conference.seatsAvailable <= 5,
+            Conference.seatsAvailable > 0)
+        ).fetch(projection=[Conference.name])
+
+        if confs:
+            # If there are almost sold out conferences,
+            # format announcement and set it in memcache
+            announcement = '%s %s' % (
+                'Last chance to attend! The following conferences '
+                'are nearly sold out:',
+                ', '.join(conf.name for conf in confs))
+            memcache.set(MEMCACHE_ANNOUNCEMENTS_KEY, announcement)
+        else:
+            # If there are no sold out conferences,
+            # delete the memcache announcements entry
+            announcement = ""
+            memcache.delete(MEMCACHE_ANNOUNCEMENTS_KEY)
+
+        return announcement
+
+    @endpoints.method(message_types.VoidMessage, StringMessage,
+                      path='conference/announcement/get',
+                      http_method='GET', name='getAnnouncement')
+    def getAnnouncement(self, request):
+        """Return Announcement from memcache."""
+        # TODO 1
+        # return an existing announcement from Memcache or an empty string.
+        announcement = "Last chance to attend!"
+        return StringMessage(data=announcement)
 
 # registers API
 api = endpoints.api_server([ConferenceApi])
