@@ -21,6 +21,7 @@ from models import BooleanMessage
 from models import ConflictException
 from google.appengine.api import memcache
 from models import StringMessage
+from google.appengine.api import taskqueue
 
 """
 conference.py -- Udacity conference server-side Python App Engine API;
@@ -227,7 +228,10 @@ class ConferenceApi(remote.Service):
 
         # create Conference & return (modified) ConferenceForm
         Conference(**data).put()
-
+        taskqueue.add(params={'email': user.email(),
+                              'conferenceInfo': repr(request)},
+                      url='/tasks/send_confirmation_email'
+                      )
         return request
 
     @endpoints.method(ConferenceForm, ConferenceForm, path='conference',
